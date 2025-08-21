@@ -1,1 +1,1 @@
-from .coupling_flow import CouplingFlow
+from .coupling_flow import CouplingFlow, DoubleCouplingFlow

@@ -59,6 +59,7 @@ class FlowMatching(InferenceNetwork):
         integrate_kwargs: dict[str, any] = None,
         optimal_transport_kwargs: dict[str, any] = None,
         subnet_kwargs: dict[str, any] = None,
+        high_fidelity_data=None,
         **kwargs,
     ):
         """
@@ -101,6 +102,7 @@ class FlowMatching(InferenceNetwork):
         """
         super().__init__(base_distribution, **kwargs)
 
+        self.high_fidelity_data = high_fidelity_data
         self.use_optimal_transport = use_optimal_transport
 
         self.integrate_kwargs = FlowMatching.INTEGRATE_DEFAULT_CONFIG | (integrate_kwargs or {})
@@ -315,9 +317,107 @@ class FlowMatching(InferenceNetwork):
 
         base_metrics = super().compute_metrics(x1, conditions=conditions, stage=stage)
 
+        # print("<>"*40)
+        # print(f"{x.shape=}")
+        # print(f"{t.shape=}")
+        # print(f"{conditions.shape=}")
+        # print("<>"*40)
         predicted_velocity = self.velocity(x, time=t, conditions=conditions, training=stage == "training")
 
         loss = self.loss_fn(target_velocity, predicted_velocity)
         loss = weighted_mean(loss, sample_weight)
 
+        if self.high_fidelity_data is not None:
+            loss_taylor = _compute_taylor_loss(self.velocity, self.summary_net, self.high_fidelity_data, self.loss_fn, self.base_distribution.sample, self.seed_generator, stage)
+            loss += keras.ops.mean(loss_taylor)
+
         return base_metrics | {"loss": loss}
+
+
+def _vel_fields(model, x_1, y, x_0_sampler, seed_generator, stage):
+    x_0 = x_0_sampler(keras.ops.shape(x_1)[:-1])
+    t = keras.random.uniform((keras.ops.shape(x_0)[0],), seed=seed_generator)
+    t = expand_right_as(t, x_0)
+    x_t = (1 - t) * x_0 + t * x_1
+    dx_t = x_1 - x_0
+    # print(x_0.shape)
+    # print(x_1.shape)
+    # print(t.shape)
+    # print(x_t.shape)
+    # print(dx_t.shape)
+    # print(y.shape)
+    v_pred = model(x_t, t, y, training=stage == "training")
+    # print(v_pred.shape)
+    return (v_pred, dx_t), (t, x_t, x_0)
+
+
+def _compute_taylor_loss(vel_net, summary_net, high_fidelity_data, loss_fn, x_0_sampler, seed_generator, stage):
+    def actual_model(x, t, y, **kwargs):
+        return vel_net(x, time=t, conditions=summary_net(y), **kwargs)
+
+    x_true, y_true, delta_y = high_fidelity_data
+    (v_pred, dx_t), (t, x_t, _) = _vel_fields(actual_model, x_true, y_true, x_0_sampler,seed_generator, stage)
+
+
+    # Batched JVP: J_{v,y}(xt, y_s_true) * delta_y
+    func_for_jvp = lambda y_arg_batch: actual_model(x_t, t, y_arg_batch, training=stage == "training")
+    # print(f"{y_true.shape=}")
+    # print(f"{delta_y.shape=}")
+    _, jvp_val = jvp_keras(func_for_jvp, (y_true,), (delta_y,))
+    # print(f"{jvp_val.shape=}")
+    # print("z"*500)
+    v_pred_corrected = v_pred + jvp_val  # v_t + JVP term
+
+    return loss_fn(dx_t, v_pred_corrected)
+
+
+import keras
+import torch
+import tensorflow as tf
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+def jvp_keras(func, primals, tangents):
+    """
+    Computes the Jacobian-vector product in a backend-agnostic way.
+
+    Args:
+        func: The function to be differentiated.
+        primals: The point at which to compute the JVP.
+        tangents: The vector with which to multiply the Jacobian.
+
+    Returns:
+        A tuple containing the output of the function and the JVP.
+    """
+    backend = keras.backend.backend()
+
+    if backend == "torch":
+        # Ensure primals and tangents are PyTorch tensors
+        primals_torch = tuple(torch.tensor(p, requires_grad=True) for p in primals)
+        tangents_torch = tuple(torch.tensor(t) for t in tangents)
+
+        # The user's original torch.autograd.functional.jvp can be used here
+        return torch.autograd.functional.jvp(func, primals_torch, tangents_torch)
+
+    elif backend == "tensorflow":
+        primals_tf = [tf.convert_to_tensor(p) for p in primals]
+        tangents_tf = [tf.convert_to_tensor(t) for t in tangents]
+        # print("oioi"*100)
+
+        with tf.autodiff.ForwardAccumulator(primals_tf, tangents_tf) as acc:
+            outputs = func(*primals_tf)
+        # print("huhuhuhu"*100)
+        jvp_val = acc.jvp(outputs)
+        # print("asdasdasd"*100)
+        return outputs, jvp_val
+
+    elif backend == "jax":
+        # Ensure primals and tangents are JAX arrays
+        primals_jax = tuple(jnp.array(p) for p in primals)
+        tangents_jax = tuple(jnp.array(t) for t in tangents)
+
+        return jax.jvp(func, primals_jax, tangents_jax)
+
+    else:
+        raise ValueError(f"Backend '{backend}' not supported for JVP computation.")
